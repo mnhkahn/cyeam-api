@@ -1,0 +1,52 @@
+name: Notify Fly Deploy Status
+
+on:
+  workflow_run:
+    workflows: [Deploy to Fly]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Lark notification
+        env:
+          LARK_BOT_WEBHOOK: ${{ secrets.LARK_BOT_WEBHOOK }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          COMMIT: ${{ github.event.workflow_run.head_sha }}
+          ACTOR: ${{ github.event.workflow_run.actor.login }}
+        run: |
+          if [ -z "$LARK_BOT_WEBHOOK" ]; then
+            echo "LARK_BOT_WEBHOOK is not configured; skipping notification."
+            exit 0
+          fi
+          if [ "$CONCLUSION" = "success" ]; then
+            ICON="✅"
+            STATUS="部署成功"
+          else
+            ICON="❌"
+            STATUS="部署失败"
+          fi
+          jq -n \
+            --arg title "$ICON Cyeam API Fly 部署通知" \
+            --arg status "$STATUS" \
+            --arg repository "$REPOSITORY" \
+            --arg branch "$BRANCH" \
+            --arg commit "$COMMIT" \
+            --arg actor "$ACTOR" \
+            --arg url "$RUN_URL" \
+            '{msg_type:"post",content:{post:{zh_cn:{title:$title,content:[
+              [{tag:"text",text:$status}],
+              [{tag:"text",text:("仓库：" + $repository)}],
+              [{tag:"text",text:("分支：" + $branch)}],
+              [{tag:"text",text:("提交：" + $commit)}],
+              [{tag:"text",text:("触发者：" + $actor)}],
+              [{tag:"a",text:"查看部署详情",href:$url}]
+            ]}}}}' | curl --fail-with-body --silent --show-error -X POST -H 'Content-Type: application/json' -d @- "$LARK_BOT_WEBHOOK"
