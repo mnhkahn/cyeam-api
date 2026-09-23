@@ -4,15 +4,19 @@ use std::{
     sync::Arc,
 };
 
+mod telemetry;
+
 use axum::{
     extract::{Path, Query, State},
     http::{header, HeaderValue, Method, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
 use pinyin::ToPinyin;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument;
 
 const RADICALS: &str = include_str!("../data/radical.yaml");
 const COMPONENT_VARIANTS: &str = include_str!("../data/component_variants.txt");
@@ -127,6 +131,7 @@ struct ErrorResponse {
 
 #[tokio::main]
 async fn main() {
+    let telemetry = telemetry::init();
     let dictionary = Arc::new(Dictionary::load());
     let app = Router::new()
         .route("/healthz", get(health))
@@ -135,7 +140,8 @@ async fn main() {
         .route("/v1/grades/{grade}", get(lookup_grade))
         .route("/v1/pinyin", get(lookup_pinyin))
         .with_state(dictionary)
-        .layer(axum::middleware::from_fn(cors));
+        .layer(middleware::from_fn(cors))
+        .layer(middleware::from_fn(observe_request));
 
     let port = std::env::var("PORT")
         .ok()
@@ -149,6 +155,10 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("serve HTTP requests");
+
+    if let Some(provider) = telemetry {
+        provider.shutdown();
+    }
 }
 
 async fn shutdown_signal() {
@@ -157,6 +167,31 @@ async fn shutdown_signal() {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+async fn observe_request(request: axum::extract::Request, next: Next) -> Response {
+    let method = request.method().to_string();
+    let path = request.uri().path().to_owned();
+    let span = tracing::info_span!(
+        "http.server.request",
+        otel.kind = "server",
+        http.request.method = %method,
+        http.route = %path,
+        url.path = %path,
+        http.response.status_code = tracing::field::Empty,
+    );
+    let started = std::time::Instant::now();
+    let response = next.run(request).instrument(span.clone()).await;
+    let status = response.status().as_u16();
+    span.record("http.response.status_code", status);
+    telemetry::record_request(&method, &path, status, started.elapsed());
+
+    if response.status().is_server_error() {
+        tracing::error!(parent: &span, duration_ms = started.elapsed().as_secs_f64() * 1_000.0, "request failed");
+    } else {
+        tracing::info!(parent: &span, duration_ms = started.elapsed().as_secs_f64() * 1_000.0, "request completed");
+    }
+    response
 }
 
 async fn search(

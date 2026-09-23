@@ -1,6 +1,12 @@
 app = "cyeam-api"
 primary_region = "nrt"
 
+[env]
+  OTEL_EXPORTER_OTLP_ENDPOINT = "https://otlp.nr-data.net"
+  OTEL_EXPORTER_OTLP_PROTOCOL = "http/protobuf"
+  OTEL_DEPLOYMENT_ENVIRONMENT = "production"
+  OTEL_SERVICE_NAME = "cyeam-api"
+
 [build]
   dockerfile = "Dockerfile"
 
