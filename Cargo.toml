@@ -8,7 +8,7 @@ publish = false
 [dependencies]
 axum = "0.8"
 opentelemetry = "0.31"
-opentelemetry-otlp = { version = "0.31", features = ["http-proto", "metrics"] }
+opentelemetry-otlp = { version = "0.31", features = ["http-proto", "metrics", "reqwest-rustls"] }
 opentelemetry_sdk = "0.31"
 pinyin = "0.10"
 serde = { version = "1", features = ["derive"] }
