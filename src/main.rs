@@ -452,7 +452,7 @@ fn allowed_origin(origin: &HeaderValue) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+mod ascii_image_tests {
     use super::*;
     use image::{DynamicImage, ImageBuffer, ImageFormat, Rgb};
     use std::io::Cursor;
