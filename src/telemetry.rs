@@ -49,10 +49,11 @@ pub fn init() -> Option<Telemetry> {
         .build();
 
     let telemetry = endpoint.map(|endpoint| {
+        let endpoint = endpoint.trim_end_matches('/');
         let span_exporter = SpanExporter::builder()
             .with_http()
             .with_protocol(Protocol::HttpBinary)
-            .with_endpoint(endpoint.clone())
+            .with_endpoint(format!("{endpoint}/v1/traces"))
             .build()
             .expect("build OpenTelemetry OTLP exporter");
         let tracer_provider = SdkTracerProvider::builder()
@@ -64,7 +65,7 @@ pub fn init() -> Option<Telemetry> {
         let metric_exporter = MetricExporter::builder()
             .with_http()
             .with_protocol(Protocol::HttpBinary)
-            .with_endpoint(endpoint)
+            .with_endpoint(format!("{endpoint}/v1/metrics"))
             .build()
             .expect("build OpenTelemetry OTLP metric exporter");
         let meter_provider = SdkMeterProvider::builder()
