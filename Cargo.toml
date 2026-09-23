@@ -1,0 +1,17 @@
+[package]
+name = "cyeam-api"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+axum = "0.8"
+pinyin = "0.10"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true
