@@ -15,6 +15,7 @@
 - `GET /v1/hanzi?text=你好`：批量返回部首、拆分、余笔、拼音与两个组词。
 - `GET /v1/grades/onegrade1st`：返回 12 份教材字表之一及其完整查字结果。
 - `GET /v1/pinyin?text=你好`：返回逐字拼音，练习纸由浏览器打印为 PDF。
+- `POST /tool/asciiimg/exec`：以 `multipart/form-data` 上传一张 PNG、JPEG 或 GIF（文件字段名不限）并可选传 `columns`（40–170）；返回字符画 `info` 和实际列数 `columns`。上传上限 4MB。
 
 浏览器 CORS 只允许 `https://www.cyeam.com` 和 `https://cyeam.com`，避免该公共 API 被任意网页直接消耗。
 

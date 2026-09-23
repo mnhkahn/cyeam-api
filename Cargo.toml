@@ -6,13 +6,14 @@ license = "MIT"
 publish = false
 
 [dependencies]
-axum = "0.8"
+axum = { version = "0.8", features = ["multipart"] }
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png"] }
 opentelemetry = "0.31"
 opentelemetry-otlp = { version = "0.31", features = ["http-proto", "metrics", "reqwest-rustls"] }
 opentelemetry_sdk = "0.31"
 pinyin = "0.10"
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
 tracing = "0.1"
 tracing-opentelemetry = "0.32"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -7,11 +7,11 @@ use std::{
 mod telemetry;
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::{header, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use pinyin::ToPinyin;
@@ -29,6 +29,12 @@ const MAX_INPUT_CHARS: usize = 8;
 const MAX_LOOKUP_CHARS: usize = 204;
 const MAX_RESULTS: usize = 100;
 const MAX_VARIANTS: usize = 20;
+const ASCII_UPLOAD_MAX_BYTES: usize = 4 * 1024 * 1024;
+const ASCII_MAX_PIXELS: u64 = 4_000_000;
+const ASCII_DEFAULT_COLUMNS: usize = 120;
+const ASCII_MIN_COLUMNS: usize = 40;
+const ASCII_MAX_COLUMNS: usize = 170;
+const ASCII_GRAYS: &[u8] = b"@w#$kdtji. ";
 
 #[derive(Clone, Debug)]
 struct Entry {
@@ -55,6 +61,12 @@ struct Dictionary {
     strokes: HashMap<String, u32>,
     phrases: Vec<String>,
     grades: HashMap<&'static str, &'static str>,
+}
+
+#[derive(Clone)]
+struct AppState {
+    dictionary: Arc<Dictionary>,
+    ascii_img_slot: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Deserialize)]
@@ -129,17 +141,34 @@ struct ErrorResponse {
     error: &'static str,
 }
 
+#[derive(Serialize)]
+struct AsciiImageResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    info: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    columns: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
 #[tokio::main]
 async fn main() {
     let telemetry = telemetry::init();
-    let dictionary = Arc::new(Dictionary::load());
+    let state = AppState {
+        dictionary: Arc::new(Dictionary::load()),
+        // Image decoding and ASCII conversion are deliberately serialized so a
+        // burst of uploads cannot multiply the process's peak memory usage.
+        ascii_img_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+    };
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/v1/zuzi", get(search))
         .route("/v1/hanzi", get(lookup_characters))
         .route("/v1/grades/{grade}", get(lookup_grade))
         .route("/v1/pinyin", get(lookup_pinyin))
-        .with_state(dictionary)
+        .route("/tool/asciiimg/exec", post(ascii_image))
+        .layer(DefaultBodyLimit::max(ASCII_UPLOAD_MAX_BYTES))
+        .with_state(state)
         .layer(middleware::from_fn(cors))
         .layer(middleware::from_fn(observe_request));
 
@@ -195,9 +224,10 @@ async fn observe_request(request: axum::extract::Request, next: Next) -> Respons
 }
 
 async fn search(
-    State(dictionary): State<Arc<Dictionary>>,
+    State(state): State<AppState>,
     Query(query): Query<SearchQuery>,
 ) -> Response {
+    let dictionary = &state.dictionary;
     let Some(raw) = query.parts else {
         return api_error(StatusCode::BAD_REQUEST, "the parts query parameter is required");
     };
@@ -234,9 +264,10 @@ async fn search(
 }
 
 async fn lookup_characters(
-    State(dictionary): State<Arc<Dictionary>>,
+    State(state): State<AppState>,
     Query(query): Query<TextQuery>,
 ) -> Response {
+    let dictionary = &state.dictionary;
     let Some(text) = query.text else {
         return api_error(StatusCode::BAD_REQUEST, "the text query parameter is required");
     };
@@ -248,9 +279,10 @@ async fn lookup_characters(
 }
 
 async fn lookup_grade(
-    State(dictionary): State<Arc<Dictionary>>,
+    State(state): State<AppState>,
     Path(grade): Path<String>,
 ) -> Response {
+    let dictionary = &state.dictionary;
     let Some(source) = dictionary.grades.get(grade.as_str()) else {
         return api_error(StatusCode::NOT_FOUND, "unknown grade");
     };
@@ -278,6 +310,110 @@ async fn lookup_pinyin(Query(query): Query<TextQuery>) -> Response {
     })
 }
 
+async fn ascii_image(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> Response {
+    let mut columns = ASCII_DEFAULT_COLUMNS;
+    let mut image = None;
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        if field.name() == Some("columns") {
+            if let Ok(value) = field.text().await {
+                columns = value
+                    .parse::<usize>()
+                    .unwrap_or(ASCII_DEFAULT_COLUMNS)
+                    .clamp(ASCII_MIN_COLUMNS, ASCII_MAX_COLUMNS);
+            }
+        } else if image.is_none() && field.file_name().is_some() {
+            match field.bytes().await {
+                Ok(bytes) => image = Some(bytes.to_vec()),
+                Err(error) => return ascii_error(error.to_string()),
+            }
+        }
+    }
+
+    let Some(image) = image else {
+        return ascii_error("没有找到图片".to_owned());
+    };
+    if image.len() > ASCII_UPLOAD_MAX_BYTES {
+        return ascii_error("图片不能超过 4MB".to_owned());
+    }
+
+    // Do not queue request bodies: they have already been accepted. A busy
+    // converter returns promptly, matching the former web handler's behavior.
+    let Ok(slot) = state.ascii_img_slot.try_acquire_owned() else {
+        return ascii_error("服务器繁忙，请稍后重试".to_owned());
+    };
+    let conversion = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        image_to_ascii(&image, columns)
+    })
+    .await;
+
+    match conversion {
+        Ok(Ok(info)) => Json(AsciiImageResponse {
+            info: Some(info),
+            columns: Some(columns),
+            error: None,
+        })
+        .into_response(),
+        Ok(Err(error)) => ascii_error(error),
+        Err(error) => ascii_error(format!("图片转换失败：{error}")),
+    }
+}
+
+fn ascii_error(error: String) -> Response {
+    Json(AsciiImageResponse {
+        info: None,
+        columns: None,
+        error: Some(error),
+    })
+    .into_response()
+}
+
+fn image_to_ascii(data: &[u8], columns: usize) -> Result<String, String> {
+    let reader = image::ImageReader::new(std::io::Cursor::new(data))
+        .with_guessed_format()
+        .map_err(|error| error.to_string())?;
+    let (width, height) = reader.into_dimensions().map_err(|error| error.to_string())?;
+    if width == 0 || height == 0 || u64::from(width) * u64::from(height) > ASCII_MAX_PIXELS {
+        return Err("图片尺寸过大".to_owned());
+    }
+    let image = image::load_from_memory(data).map_err(|error| error.to_string())?.to_rgb8();
+    let columns = columns.min(width as usize);
+    if columns == 0 {
+        return Err("图片尺寸无效".to_owned());
+    }
+    let block_width = (width as usize / columns).max(1);
+    let block_height = block_width * 2;
+    let rows = height as usize / block_height;
+    let mut output = String::with_capacity(rows * (columns + 2));
+
+    for row in 0..rows {
+        for column in 0..columns {
+            let x0 = column * block_width;
+            let y0 = row * block_height;
+            let block_width = block_width.min(width as usize - x0);
+            let block_height = block_height.min(height as usize - y0);
+            let mut gray_sum = 0_u64;
+            for y in y0..y0 + block_height {
+                for x in x0..x0 + block_width {
+                    let [red, green, blue] = image.get_pixel(x as u32, y as u32).0;
+                    gray_sum += u64::from(red) * 257 * 3 / 10
+                        + u64::from(green) * 257 * 59 / 100
+                        + u64::from(blue) * 257 * 11 / 100;
+                }
+            }
+            let gray = gray_sum / (block_width * block_height) as u64;
+            let index = (gray / 5_958).min((ASCII_GRAYS.len() - 1) as u64) as usize;
+            output.push(ASCII_GRAYS[index] as char);
+        }
+        output.push_str("\r\n");
+    }
+    Ok(output)
+}
+
 fn cached_json<T: Serialize>(value: T) -> Response {
     let mut response = Json(value).into_response();
     response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=300, s-maxage=86400"));
@@ -292,7 +428,15 @@ fn api_error(status: StatusCode, error: &'static str) -> Response {
 // that consumes it. Non-browser callers can still use ordinary GET requests.
 async fn cors(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
     if request.method() == Method::OPTIONS {
-        return StatusCode::NO_CONTENT.into_response();
+        let origin = request.headers().get(header::ORIGIN).cloned();
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        if let Some(origin) = origin.filter(allowed_origin) {
+            response.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+            response.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, OPTIONS"));
+            response.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("Content-Type"));
+            response.headers_mut().insert(header::VARY, HeaderValue::from_static("Origin"));
+        }
+        return response;
     }
     let origin = request.headers().get(header::ORIGIN).cloned();
     let mut response = next.run(request).await;
@@ -305,6 +449,29 @@ async fn cors(request: axum::extract::Request, next: axum::middleware::Next) -> 
 
 fn allowed_origin(origin: &HeaderValue) -> bool {
     matches!(origin.to_str(), Ok("https://www.cyeam.com") | Ok("https://cyeam.com"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{DynamicImage, ImageBuffer, ImageFormat, Rgb};
+    use std::io::Cursor;
+
+    #[test]
+    fn ascii_conversion_uses_the_expected_ramp_and_line_endings() {
+        let image = ImageBuffer::from_pixel(2, 2, Rgb([255, 255, 255]));
+        let mut encoded = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(image)
+            .write_to(&mut encoded, ImageFormat::Png)
+            .expect("encode test image");
+
+        assert_eq!(image_to_ascii(&encoded.into_inner(), ASCII_DEFAULT_COLUMNS), Ok("  \r\n".to_owned()));
+    }
+
+    #[test]
+    fn invalid_image_is_rejected() {
+        assert!(image_to_ascii(b"not an image", ASCII_DEFAULT_COLUMNS).is_err());
+    }
 }
 
 impl Dictionary {
