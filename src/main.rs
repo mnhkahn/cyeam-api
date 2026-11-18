@@ -517,7 +517,10 @@ impl Dictionary {
     fn supports(&self, parts: &str) -> bool {
         parts.chars().all(|character| {
             let part = character.to_string();
-            self.by_part.contains_key(&part)
+            // Single-character queries also serve "decompose this word" lookups,
+            // so dictionary words that never act as a component must pass too.
+            self.by_word.contains_key(&part)
+                || self.by_part.contains_key(&part)
                 || self.component_candidates(&part).iter().any(|candidate| self.by_part.contains_key(candidate))
         })
     }
@@ -564,7 +567,9 @@ impl Dictionary {
             .filter(|index| !seen.contains(&self.entries[*index].word))
             .filter(|index| candidates.iter().all(|choices| choices.iter().any(|choice| self.entries[*index].parts.contains(choice))))
             .collect();
-        partial.sort_by_key(|index| self.entries[*index].parts.len());
+        // Duplicate dictionary rows share a part count; break ties by load order
+        // so the deduplication below always keeps the same entry.
+        partial.sort_by_key(|index| (self.entries[*index].parts.len(), *index));
         let mut partial_seen = HashSet::new();
         partial.retain(|index| partial_seen.insert(self.entries[*index].word.clone()));
         partial.truncate(MAX_RESULTS);
@@ -771,5 +776,27 @@ mod tests {
     fn parses_valid_codepoints() {
         assert_eq!(parse_codepoint("U+263F6"), Some("𦏶".to_owned()));
         assert_eq!(parse_codepoint("U+D800"), None);
+    }
+
+    #[test]
+    fn supports_dictionary_words_that_never_act_as_components() {
+        let dictionary = Dictionary::load();
+        assert!(dictionary.by_word.contains_key("搼"));
+        assert!(!dictionary.by_part.contains_key("搼"));
+        assert!(dictionary.supports("搼"));
+        assert!(!dictionary.word_for_char("搼").parts.is_empty());
+        assert!(!dictionary.supports("A"));
+    }
+
+    #[test]
+    fn search_is_deterministic_with_duplicate_dictionary_rows() {
+        let dictionary = Dictionary::load();
+        let first = dictionary.search("拳");
+        for _ in 0..16 {
+            assert_eq!(dictionary.search("拳"), first);
+        }
+        let (_, partial) = first;
+        let gen_index = partial.iter().find(|index| dictionary.entries[**index].word == "搼").expect("搼 in partial results");
+        assert_eq!(dictionary.entries[*gen_index].parts, vec!["手".to_owned(), "拳".to_owned()]);
     }
 }
